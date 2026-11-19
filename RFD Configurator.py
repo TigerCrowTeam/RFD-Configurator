@@ -5,6 +5,7 @@ Detects USB serial radios, enters SiK AT command mode, and reads/writes every
 S-register parameter (local radio via AT..., remote radio via RT...).
 """
 
+import json
 import queue
 import re
 import threading
@@ -131,16 +132,25 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ------------------------------------------------------------------ UI
+    def _theme(self, dark):
+        return {
+            "background": "#111827" if dark else "#f3f5f9",
+            "surface": "#1f2937" if dark else "#ffffff",
+            "field": "#0f172a" if dark else "#ffffff",
+            "foreground": "#e5e7eb" if dark else "#1e293b",
+            "muted": "#9ca3af" if dark else "#64748b",
+            "border": "#4b5563" if dark else "#d5dce7",
+            "title": "#bfdbfe" if dark else "#233c65",
+            "log": "#0b1220" if dark else "#eaf0f7",
+            "log_foreground": "#dbeafe" if dark else "#334155",
+        }
+
     def _build_ui(self):
         pad = {"padx": 6, "pady": 3}
 
-        bg = "#F3F5F9"  # light blue-gray (243, 245, 249)
-        self.root.configure(bg=bg)
-        style = ttk.Style()
-        style.theme_use("clam")
-        for cls in ("TFrame", "TLabelframe", "TLabel", "TCheckbutton", "TRadiobutton"):
-            style.configure(cls, background=bg)
-        style.configure("TLabelframe.Label", background=bg, font=("TkDefaultFont", 10, "bold"))
+        self.style = ttk.Style()
+        self.style.theme_use("clam")
+        self.dark_var = tk.BooleanVar(value=False)
 
         conn = ttk.LabelFrame(self.root, text="Connection")
         conn.pack(fill="x", padx=8, pady=4)
@@ -152,14 +162,13 @@ class App:
         self.show_all_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(conn, text="Show all ports", variable=self.show_all_var,
                         command=self.refresh_ports).grid(row=0, column=3, **pad)
+        ttk.Checkbutton(conn, text="Dark mode", variable=self.dark_var,
+                        command=self.apply_theme).grid(row=0, column=5, **pad)
 
         ttk.Label(conn, text="Baud:").grid(row=1, column=0, **pad)
         self.baud_var = tk.StringVar(value=str(DEFAULT_BAUD))
         ttk.Combobox(conn, textvariable=self.baud_var, values=BAUD_CHOICES,
                      width=10).grid(row=1, column=1, sticky="w", **pad)
-        self.auto_baud_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(conn, text="Auto-detect baud when entering command mode",
-                        variable=self.auto_baud_var).grid(row=1, column=2, columnspan=2, sticky="w", **pad)
         self.connect_btn = ttk.Button(conn, text="Connect", command=self.on_connect_toggle)
         self.connect_btn.grid(row=0, column=4, rowspan=2, **pad)
 
@@ -193,18 +202,47 @@ class App:
         ttk.Label(radio, textvariable=self.state_var).grid(row=2, column=0, columnspan=3, sticky="w", **pad)
         ttk.Label(radio, textvariable=self.version_var).grid(row=2, column=3, columnspan=3, sticky="w", **pad)
 
-        self.params_frame = ttk.LabelFrame(self.root, text="Parameters")
-        self.params_frame.pack(fill="x", padx=8, pady=4)
+        self.bottom_pane = tk.PanedWindow(self.root, orient="vertical", sashrelief="raised", sashwidth=6)
+        self.bottom_pane.pack(fill="both", expand=True, padx=8, pady=4)
+        bottom = self.bottom_pane
+
+        top_pane = ttk.Frame(bottom)
+        params_outer = ttk.LabelFrame(top_pane, text="Parameters")
+        params_outer.pack(fill="both", expand=True)
+        self.params_canvas = tk.Canvas(params_outer, highlightthickness=0)
+        params_sb = ttk.Scrollbar(params_outer, orient="vertical", command=self.params_canvas.yview)
+        self.params_canvas.configure(yscrollcommand=params_sb.set)
+        params_sb.pack(side="right", fill="y")
+        self.params_canvas.pack(side="left", fill="both", expand=True)
+        self.params_frame = ttk.Frame(self.params_canvas)
+        self.params_canvas.create_window((0, 0), window=self.params_frame, anchor="nw")
+        self.params_frame.bind(
+            "<Configure>",
+            lambda e: self.params_canvas.configure(scrollregion=self.params_canvas.bbox("all")),
+        )
+        for widget in (self.params_canvas, self.params_frame):
+            widget.bind("<MouseWheel>", self._on_params_mousewheel)
+            widget.bind("<Button-4>", self._on_params_mousewheel)
+            widget.bind("<Button-5>", self._on_params_mousewheel)
         for num, name, choices, lo, hi, desc, ro in PARAMS:
             self._add_row(num, name, choices, lo, hi, desc, ro)
 
-        term = ttk.LabelFrame(self.root, text="Log / Terminal")
-        term.pack(fill="both", expand=True, padx=8, pady=4)
-        self.log_text = tk.Text(term, height=10, state="disabled", wrap="word", bg="white")
+        params_btns = ttk.Frame(top_pane)
+        params_btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(params_btns, text="Copy Parameters", command=self.on_copy_params).pack(side="left", padx=(0, 6))
+        ttk.Button(params_btns, text="Paste Parameters", command=self.on_paste_params).pack(side="left")
+        bottom.add(top_pane, stretch="always")
+
+        term = ttk.LabelFrame(bottom, text="Log / Terminal")
+        self.log_text = tk.Text(term, height=10, state="disabled", wrap="word")
         sb = ttk.Scrollbar(term, command=self.log_text.yview)
         self.log_text.config(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.log_text.pack(fill="both", expand=True)
+        self.log_text.bind("<MouseWheel>", self._on_log_mousewheel)
+        self.log_text.bind("<Button-4>", self._on_log_mousewheel)
+        self.log_text.bind("<Button-5>", self._on_log_mousewheel)
+        bottom.add(term, stretch="always")
 
         send = ttk.Frame(self.root)
         send.pack(fill="x", padx=8, pady=(0, 8))
@@ -216,6 +254,62 @@ class App:
         self.raw_btn.pack(side="left")
 
         self.update_buttons()
+        self.apply_theme()
+
+    def _on_log_mousewheel(self, event):
+        if event.num == 4:
+            self.log_text.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.log_text.yview_scroll(1, "units")
+        else:
+            self.log_text.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _on_params_mousewheel(self, event):
+        if event.num == 4:
+            self.params_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.params_canvas.yview_scroll(1, "units")
+        else:
+            self.params_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def apply_theme(self):
+        theme = self._theme(self.dark_var.get())
+        bg, fg = theme["background"], theme["foreground"]
+        field, border = theme["field"], theme["border"]
+        surface, title = theme["surface"], theme["title"]
+
+        self.root.configure(bg=bg)
+        style = self.style
+        for cls in ("TFrame", "TLabelframe", "TLabel", "TCheckbutton", "TRadiobutton"):
+            style.configure(cls, background=surface, foreground=fg)
+        style.map("TCheckbutton", background=[("active", surface)], foreground=[("active", fg)])
+        style.map("TRadiobutton", background=[("active", surface)], foreground=[("active", fg)])
+        style.configure("TLabelframe", background=surface, bordercolor=border,
+                        lightcolor=surface, darkcolor=surface)
+        style.configure("TLabelframe.Label", background=surface, foreground=title,
+                        font=("TkDefaultFont", 10, "bold"))
+        style.configure("TButton", background=field, foreground=fg,
+                        bordercolor=border, lightcolor=field, darkcolor=field)
+        style.map("TButton", background=[("active", field)])
+        style.configure("TEntry", fieldbackground=field, foreground=fg,
+                        insertcolor=fg, bordercolor=border,
+                        lightcolor=field, darkcolor=field)
+        style.configure("TCombobox", fieldbackground=field, foreground=fg,
+                        background=field, insertcolor=fg, bordercolor=border,
+                        lightcolor=field, darkcolor=field, arrowcolor=fg)
+        style.map("TCombobox", fieldbackground=[("readonly", field)],
+                  foreground=[("readonly", fg)])
+
+        if hasattr(self, "log_text"):
+            self.log_text.config(bg=theme["log"], fg=theme["log_foreground"],
+                                 insertbackground=theme["log_foreground"],
+                                 highlightbackground=border, highlightcolor=border)
+        if hasattr(self, "bottom_pane"):
+            self.bottom_pane.config(bg=surface, sashpad=0, bd=0)
+        if hasattr(self, "params_canvas"):
+            self.params_canvas.config(bg=surface, highlightbackground=border)
 
     def _add_row(self, num, name, choices, lo, hi, desc, read_only):
         r = len(self.rows)
@@ -351,8 +445,7 @@ class App:
         if not port:
             messagebox.showerror("Error", "No port selected")
             return
-        auto = self.auto_baud_var.get()
-        self.submit(lambda: self._job_enter(port, baud, auto))
+        self.submit(lambda: self._job_enter(port, baud))
 
     def on_exit(self):
         self.submit(self._job_exit)
@@ -391,6 +484,47 @@ class App:
             return
         self.raw_var.set("")
         self.submit(lambda: self._job_raw(cmd))
+
+    def on_copy_params(self):
+        data = {}
+        for num, row in self.rows.items():
+            raw = row.var.get().strip()
+            if raw == "":
+                continue
+            try:
+                data[str(num)] = row.parse(raw)
+            except ValueError:
+                continue
+        if not data:
+            messagebox.showinfo("Copy Parameters", "No parameters to copy. Read from a radio first.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(json.dumps(data))
+        self.log(f"Copied {len(data)} parameters to clipboard")
+
+    def on_paste_params(self):
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            messagebox.showerror("Paste Parameters", "Clipboard is empty")
+            return
+        try:
+            data = json.loads(text)
+        except ValueError:
+            messagebox.showerror("Paste Parameters", "Clipboard does not contain valid parameter data")
+            return
+        applied = 0
+        for key, val in data.items():
+            try:
+                num = int(key)
+            except ValueError:
+                continue
+            row = self.rows.get(num)
+            if row is None or row.read_only:
+                continue
+            row.var.set(row.to_display(val))
+            applied += 1
+        self.log(f"Pasted {applied} parameters (review values, then Write Changes & Save)")
 
     def on_close(self):
         self._close()
@@ -474,22 +608,19 @@ class App:
         resp = self._cmd("ATI", total=1.0)
         return "SiK" in resp or "RFD" in resp
 
-    def _job_enter(self, port, baud, auto):
+    def _job_enter(self, port, baud):
         if self.ser is None:
             self._open(port, baud)
-        bauds = [baud] + ([b for b in BAUD_CHOICES if b != baud] if auto else [])
-        for b in bauds:
-            self.ser.baudrate = b
-            self.log(f"Trying command mode at {b} baud...")
-            if self._try_enter():
-                self.in_cmd = True
-                self.log(f"Command mode active at {b} baud")
-                self.ui(lambda b=b: (self.baud_var.set(str(b)), self.set_state(True, True)))
-                ver = self._cmd("ATI")
-                self.ui(lambda: self.version_var.set(ver.splitlines()[-1] if ver else ""))
-                self._read_all("AT")
-                return
         self.ser.baudrate = baud
+        self.log(f"Trying command mode at {baud} baud...")
+        if self._try_enter():
+            self.in_cmd = True
+            self.log(f"Command mode active at {baud} baud")
+            self.ui(lambda: self.set_state(True, True))
+            ver = self._cmd("ATI")
+            self.ui(lambda: self.version_var.set(ver.splitlines()[-1] if ver else ""))
+            self._read_all("AT")
+            return
         self.log("Could not enter command mode. Check port, baud, and that the radio is powered.")
 
     def _job_exit(self):
